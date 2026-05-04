@@ -1,0 +1,812 @@
+#!/usr/bin/env bash
+#
+# claude-mv — Move/rename directories without orphaning Claude Code conversation threads.
+#
+# Usage:
+#   claude-mv <source> <destination>                                Move dir + update sessions
+#   claude-mv --dry-run <source> <dest>                             Preview move
+#   claude-mv --reassign [--memory-mode <m>] <uuid> <target_dir>    Move a session to a different project
+#   claude-mv --reassign-dry-run [--memory-mode <m>] <uuid> <dir>   Preview reassign
+#   claude-mv --reconcile [directory]                               Find orphaned sessions
+#   claude-mv --list                                                List all Claude project sessions
+#
+# How it works:
+#   Claude Code stores conversation history in ~/.claude/projects/ using a key derived
+#   from the absolute directory path (every non-alphanumeric char → hyphen). When you
+#   move or rename a directory, the key changes and Claude can't find the old sessions.
+#   This script moves both the directory AND renames the session directory atomically.
+#
+# Memory file handling for --reassign:
+#   Memories are scoped per-project (~/.claude/projects/<encoded>/memory/*.md), not
+#   per-session. When you reassign a session to a new project, by default the tool walks
+#   each memory file interactively and asks: move with session / keep at source / copy
+#   to both / skip. The default action (Enter) is "move", since failing to migrate
+#   memories silently breaks session context. Use --memory-mode to override:
+#     prompt (default) — interactive per-file
+#     move             — move all memories without asking
+#     copy             — copy all memories to dest, leave source intact
+#     skip             — leave all memories at source (the OLD broken behavior)
+
+set -euo pipefail
+
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+CLAUDE_BACKUP_DIR="$HOME/.claude/claude-mv-backups"
+
+# Global: whether to create a backup before destructive ops (set by --no-backup)
+DO_BACKUP=true
+
+# Global: whether to copy follow-up commands to the clipboard (set by --no-clipboard)
+DO_CLIPBOARD=true
+
+# Copy stdin to the system clipboard. Tries pbcopy (macOS), xclip/xsel (Linux),
+# clip.exe (WSL/Windows). Returns 0 on success, 1 if no clipboard tool exists.
+# Reads from stdin (instead of taking a string arg) so callers can pipe a
+# printf with a trailing newline — which is what makes paste-and-execute work
+# in terminals. $() command substitution would strip the trailing newline.
+copy_to_clipboard() {
+    if command -v pbcopy >/dev/null 2>&1; then
+        pbcopy
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard
+    elif command -v xsel >/dev/null 2>&1; then
+        xsel --clipboard --input
+    elif command -v clip.exe >/dev/null 2>&1; then
+        clip.exe
+    else
+        cat >/dev/null  # consume stdin to avoid SIGPIPE in caller
+        return 1
+    fi
+    return 0
+}
+
+# Tarball one or more ~/.claude/projects/<key>/ directories to a timestamped
+# backup file. Called after the user confirms a destructive operation but
+# BEFORE any actual mv/cp/rm. Returns 0 on success (or no-op if nothing to
+# back up), 1 on failure (caller should abort).
+backup_claude_state() {
+    local op_name="$1"
+    shift
+    local keys=("$@")
+
+    mkdir -p "$CLAUDE_BACKUP_DIR"
+
+    local ts
+    ts=$(date +%Y-%m-%d-%H%M%S)
+    local backup_file="$CLAUDE_BACKUP_DIR/${ts}-${op_name}.tar.gz"
+
+    # Collect existing project dirs as paths relative to root
+    local relpaths=()
+    local key
+    for key in "${keys[@]}"; do
+        local abs="$CLAUDE_PROJECTS_DIR/$key"
+        if [ -e "$abs" ]; then
+            relpaths+=("${abs#/}")
+        fi
+    done
+
+    if [ ${#relpaths[@]} -eq 0 ]; then
+        # Nothing to back up (no existing project state) — safe to proceed
+        echo "💾 Backup: nothing to back up (no existing project state)"
+        return 0
+    fi
+
+    if tar -C / -czf "$backup_file" "${relpaths[@]}" 2>/dev/null; then
+        local size_kb
+        size_kb=$(($(wc -c < "$backup_file") / 1024))
+        echo "💾 Backup: $backup_file (${size_kb}KB)"
+        echo "   Restore: tar -xzf '$backup_file' -C /"
+        return 0
+    else
+        echo "ERROR: backup failed (tar exited non-zero) — aborting to avoid data loss" >&2
+        return 1
+    fi
+}
+
+# Convert an absolute path to Claude's project key
+path_to_key() {
+    local path="$1"
+    # Resolve to absolute path
+    if [[ "$path" != /* ]]; then
+        path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
+    fi
+    # Remove trailing slash
+    path="${path%/}"
+    # Replace every non-alphanumeric char with hyphen
+    echo "$path" | sed 's/[^a-zA-Z0-9]/-/g'
+}
+
+# Reverse: convert a key back to approximate path (replace - with /, best effort)
+key_to_path() {
+    local key="$1"
+    # This is lossy — we can't distinguish / from _ from . from space
+    # But we can check if the path exists
+    echo "$key" | sed 's/^-/\//' | sed 's/-/\//g'
+}
+
+# List all sessions
+cmd_list() {
+    echo "Claude Code project sessions:"
+    echo ""
+    for dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        local key=$(basename "$dir")
+        local n_sessions=$(find "$dir" -name "*.jsonl" -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+        local has_memory=""
+        [ -d "$dir/memory" ] && has_memory=" [has memory]"
+        echo "  $key"
+        echo "    Sessions: $n_sessions$has_memory"
+    done
+}
+
+# Reconcile: find sessions whose original directory no longer exists
+cmd_reconcile() {
+    local search_root="${1:-$HOME/Desktop}"
+    echo "Scanning for orphaned Claude sessions..."
+    echo "Search root for relocated dirs: $search_root"
+    echo ""
+
+    local orphaned=0
+    local fixed=0
+
+    for dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        local key=$(basename "$dir")
+        local n_sessions=$(find "$dir" -name "*.jsonl" -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+        [ "$n_sessions" -eq 0 ] && continue  # skip empty session dirs
+
+        # Try to reconstruct the path and check if it exists
+        # We can't perfectly reverse the encoding, but we can check known paths
+        local found_match=false
+
+        # Search for directories whose key matches this one
+        while IFS= read -r candidate; do
+            local candidate_key=$(path_to_key "$candidate")
+            if [ "$candidate_key" = "$key" ]; then
+                found_match=true
+                break
+            fi
+        done < <(find "$search_root" -maxdepth 4 -type d 2>/dev/null)
+
+        if ! $found_match; then
+            echo "  ORPHANED: $key ($n_sessions sessions)"
+
+            # Try to find where it moved by checking git remotes or CLAUDE.md
+            if [ -f "$dir/memory/MEMORY.md" ]; then
+                echo "    Has memory — likely important"
+            fi
+
+            # Look for possible new locations by searching for CLAUDE.md files
+            # that reference similar project names
+            local basename_guess=$(echo "$key" | rev | cut -d- -f1 | rev)
+            if [ -n "$basename_guess" ] && [ ${#basename_guess} -gt 3 ]; then
+                local candidates=$(find "$search_root" -maxdepth 4 -type d -name "*$basename_guess*" 2>/dev/null | head -5)
+                if [ -n "$candidates" ]; then
+                    echo "    Possible new locations:"
+                    echo "$candidates" | while read -r c; do
+                        local c_key=$(path_to_key "$c")
+                        echo "      $c → key: $c_key"
+                    done
+                fi
+            fi
+            echo ""
+            orphaned=$((orphaned + 1))
+        fi
+    done
+
+    echo "Found $orphaned orphaned session(s)."
+    if [ $orphaned -gt 0 ]; then
+        echo ""
+        echo "To fix, run:  claude-mv <old_path> <new_path>"
+        echo "Or if the old directory is gone, manually rename the session dir:"
+        echo "  mv ~/.claude/projects/<old_key> ~/.claude/projects/<new_key>"
+    fi
+}
+
+# Move a directory and update Claude sessions
+cmd_move() {
+    local dry_run="$1"
+    local src="$2"
+    local dst="$3"
+
+    # Resolve absolute paths
+    if [[ "$src" != /* ]]; then
+        src="$(pwd)/$src"
+    fi
+    if [[ "$dst" != /* ]]; then
+        dst="$(pwd)/$dst"
+    fi
+    src="${src%/}"
+    dst="${dst%/}"
+
+    # Validate
+    if [ ! -e "$src" ]; then
+        echo "Error: source '$src' does not exist" >&2
+        exit 1
+    fi
+    if [ -e "$dst" ]; then
+        echo "Error: destination '$dst' already exists" >&2
+        exit 1
+    fi
+
+    local src_key=$(path_to_key "$src")
+    local dst_key=$(path_to_key "$dst")
+
+    echo "Moving directory:"
+    echo "  From: $src"
+    echo "  To:   $dst"
+    echo ""
+    echo "Claude session key:"
+    echo "  Old: $src_key"
+    echo "  New: $dst_key"
+    echo ""
+
+    # Find all session directories that START with the source key
+    # (this catches the directory itself AND any subdirectory projects)
+    local sessions_to_move=()
+    for session_dir in "$CLAUDE_PROJECTS_DIR"/$src_key*; do
+        [ -d "$session_dir" ] || continue
+        local old_name=$(basename "$session_dir")
+        # Must match exactly or be a subdirectory (key followed by -)
+        if [ "$old_name" = "$src_key" ] || [[ "$old_name" == "$src_key-"* ]]; then
+            sessions_to_move+=("$old_name")
+        fi
+    done
+
+    if [ ${#sessions_to_move[@]} -eq 0 ]; then
+        echo "No Claude sessions found for this path."
+    else
+        echo "Sessions to update (${#sessions_to_move[@]}):"
+        for old_name in "${sessions_to_move[@]}"; do
+            local suffix="${old_name#$src_key}"
+            local new_name="${dst_key}${suffix}"
+            local n=$(find "$CLAUDE_PROJECTS_DIR/$old_name" -name "*.jsonl" -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+            echo "  $old_name → $new_name ($n sessions)"
+        done
+    fi
+    echo ""
+
+    if [ "$dry_run" = "true" ]; then
+        echo "[DRY RUN] No changes made."
+        return
+    fi
+
+    # Confirm
+    read -p "Proceed? [y/N] " confirm
+    if [[ "$confirm" != [yY]* ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    # Backup before any destructive op
+    if $DO_BACKUP; then
+        local backup_keys=()
+        for old_name in "${sessions_to_move[@]}"; do
+            backup_keys+=("$old_name")
+        done
+        if [ ${#backup_keys[@]} -gt 0 ]; then
+            if ! backup_claude_state "move" "${backup_keys[@]}"; then
+                exit 1
+            fi
+        fi
+    fi
+
+    # 1. Move the actual directory
+    echo "Moving directory..."
+    mv "$src" "$dst"
+
+    # 2. Rename all matching session directories
+    for old_name in "${sessions_to_move[@]}"; do
+        local suffix="${old_name#$src_key}"
+        local new_name="${dst_key}${suffix}"
+        echo "Updating session: $old_name → $new_name"
+        mv "$CLAUDE_PROJECTS_DIR/$old_name" "$CLAUDE_PROJECTS_DIR/$new_name"
+    done
+
+    echo ""
+    echo "Done. Directory moved and ${#sessions_to_move[@]} session(s) updated."
+
+    # Copy a paste-ready cd command to the clipboard. Trailing newline makes
+    # paste-and-execute work in the destination terminal.
+    if $DO_CLIPBOARD; then
+        if printf 'cd "%s"\n' "$dst" | copy_to_clipboard; then
+            echo "📋 cd command copied to clipboard — paste into any terminal"
+        fi
+    fi
+
+    echo "You can verify with: claude-mv --list"
+}
+
+# Print a memory file's identity card: filename, frontmatter (name/description/type),
+# and first 2 non-empty lines of body. Used by the interactive reassign prompt.
+show_memory_card() {
+    local file="$1"
+    local indent="  "
+    echo "${indent}📄 $(basename "$file")"
+    awk -v indent="${indent}     " '
+        BEGIN { in_fm=0; fm_done=0; body_lines=0 }
+        /^---[[:space:]]*$/ {
+            if (in_fm == 0 && fm_done == 0) { in_fm=1; next }
+            else if (in_fm == 1) { in_fm=0; fm_done=1; next }
+        }
+        in_fm == 1 {
+            if ($0 ~ /^(name|description|type):/) {
+                print indent $0
+            }
+            next
+        }
+        fm_done == 1 && body_lines < 2 {
+            if (NF > 0) {
+                print indent $0
+                body_lines++
+            }
+        }
+    ' "$file"
+}
+
+# Migrate a single MEMORY.md index line referencing <filename> from src to dst.
+# mode: "move" (delete from src) or "copy" (leave in src).
+# Safe no-op if src index is missing or has no matching line.
+migrate_memory_index_line() {
+    local mem_filename="$1"
+    local src_index="$2"
+    local dst_index="$3"
+    local mode="$4"
+
+    [ -f "$src_index" ] || return 0
+
+    local matched_lines
+    matched_lines=$(grep -F "($mem_filename)" "$src_index" || true)
+    [ -n "$matched_lines" ] || return 0
+
+    # Append to dest index, creating it with a header if needed
+    if [ ! -f "$dst_index" ]; then
+        printf "# Memory Index\n\n" > "$dst_index"
+    fi
+    printf "%s\n" "$matched_lines" >> "$dst_index"
+
+    if [ "$mode" = "move" ]; then
+        local tmp
+        tmp=$(mktemp)
+        grep -vF "($mem_filename)" "$src_index" > "$tmp" || true
+        mv "$tmp" "$src_index"
+        # If stripping left the file empty (e.g. it had no `# Memory Index`
+        # header to begin with), restore the standard header so future
+        # memories have an index file to append to.
+        if [ ! -s "$src_index" ]; then
+            printf "# Memory Index\n\n" > "$src_index"
+        fi
+    fi
+}
+
+# Reassign a conversation session from one project to another
+cmd_reassign() {
+    local memory_mode="$1"  # prompt|move|copy|skip
+    local dry_run="$2"
+    local session_id="$3"
+    local target_dir="$4"
+
+    # Resolve target to absolute path
+    if [[ "$target_dir" != /* ]]; then
+        target_dir="$(pwd)/$target_dir"
+    fi
+    target_dir="${target_dir%/}"
+
+    local target_key=$(path_to_key "$target_dir")
+
+    # Find which project currently owns this session
+    local found_in=""
+    local found_jsonl=""
+    local found_session_dir=""
+
+    for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+        [ -d "$project_dir" ] || continue
+        if [ -f "$project_dir/${session_id}.jsonl" ]; then
+            found_in=$(basename "$project_dir")
+            found_jsonl="$project_dir/${session_id}.jsonl"
+            if [ -d "$project_dir/${session_id}" ]; then
+                found_session_dir="$project_dir/${session_id}"
+            fi
+            break
+        fi
+    done
+
+    if [ -z "$found_in" ]; then
+        echo "Error: session '$session_id' not found in any project" >&2
+        echo ""
+        echo "Hint: use 'claude-mv --list' to see all sessions, or provide a partial UUID."
+        # Try partial match
+        local partial_matches=()
+        for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+            for jsonl in "$project_dir"/*"$session_id"*.jsonl; do
+                [ -f "$jsonl" ] || continue
+                partial_matches+=("$(basename "$jsonl" .jsonl) in $(basename "$project_dir")")
+            done
+        done
+        if [ ${#partial_matches[@]} -gt 0 ]; then
+            echo ""
+            echo "Partial matches:"
+            for m in "${partial_matches[@]}"; do
+                echo "  $m"
+            done
+        fi
+        exit 1
+    fi
+
+    local target_project_dir="$CLAUDE_PROJECTS_DIR/$target_key"
+    local src_memory_dir="$CLAUDE_PROJECTS_DIR/$found_in/memory"
+    local dst_memory_dir="$target_project_dir/memory"
+
+    echo "Reassigning conversation:"
+    echo "  Session:  $session_id"
+    echo "  From:     $found_in"
+    echo "  To:       $target_key"
+    echo "  Target:   $target_dir"
+    echo ""
+
+    # Show session info
+    local size=$(wc -c < "$found_jsonl" | tr -d ' ')
+    echo "  Session size: $(($size / 1024))KB"
+    if [ -n "$found_session_dir" ]; then
+        echo "  Has session directory (metadata/snapshots)"
+    fi
+    echo ""
+
+    # === Discover memory files in source (excluding the MEMORY.md index) ===
+    local memory_files=()
+    if [ -d "$src_memory_dir" ]; then
+        while IFS= read -r f; do
+            local name
+            name=$(basename "$f")
+            if [ "$name" != "MEMORY.md" ]; then
+                memory_files+=("$name")
+            fi
+        done < <(find "$src_memory_dir" -maxdepth 1 -name "*.md" -type f 2>/dev/null | sort)
+    fi
+
+    # Decide per-file action: move | copy | keep | skip
+    local memory_actions=()
+
+    if [ ${#memory_files[@]} -gt 0 ]; then
+        # Show context: how many other sessions share this memory dir
+        local n_sessions_in_src
+        n_sessions_in_src=$(find "$CLAUDE_PROJECTS_DIR/$found_in" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+        local n_other_sessions=$((n_sessions_in_src - 1))
+
+        echo "Source project has ${#memory_files[@]} memory file(s) loaded into this session."
+        if [ "$n_other_sessions" -gt 0 ]; then
+            echo "⚠  $n_other_sessions other session(s) in source project share this memory dir."
+            echo "   Moving memories will remove them from those sessions' context."
+        fi
+        echo ""
+
+        case "$memory_mode" in
+            move)
+                local i
+                for i in "${memory_files[@]}"; do memory_actions+=("move"); done
+                ;;
+            copy)
+                local i
+                for i in "${memory_files[@]}"; do memory_actions+=("copy"); done
+                ;;
+            skip)
+                local i
+                for i in "${memory_files[@]}"; do memory_actions+=("keep"); done
+                ;;
+            prompt)
+                if [ "$dry_run" = "true" ]; then
+                    echo "(dry-run: prompt mode would walk these files; assuming default 'move')"
+                    echo ""
+                    local f
+                    for f in "${memory_files[@]}"; do
+                        show_memory_card "$src_memory_dir/$f"
+                        echo ""
+                        memory_actions+=("move")
+                    done
+                else
+                    local f
+                    for f in "${memory_files[@]}"; do
+                        show_memory_card "$src_memory_dir/$f"
+                        echo ""
+                        local choice=""
+                        read -p "  Action? [M]ove with session (default) / [k]eep at source / [c]opy to both / [s]kip: " choice
+                        case "$choice" in
+                            ""|m|M|move)
+                                memory_actions+=("move")
+                                ;;
+                            k|K|keep)
+                                memory_actions+=("keep")
+                                ;;
+                            c|C|copy)
+                                memory_actions+=("copy")
+                                ;;
+                            s|S|skip)
+                                memory_actions+=("skip")
+                                ;;
+                            *)
+                                echo "  (unrecognized — defaulting to move)"
+                                memory_actions+=("move")
+                                ;;
+                        esac
+                        echo ""
+                    done
+                fi
+                ;;
+        esac
+    fi
+
+    # === Pre-check: refuse to overwrite existing dest memory files ===
+    if [ ${#memory_files[@]} -gt 0 ]; then
+        local collision=false
+        local i
+        for i in "${!memory_files[@]}"; do
+            local f="${memory_files[$i]}"
+            local act="${memory_actions[$i]}"
+            if [ "$act" = "move" ] || [ "$act" = "copy" ]; then
+                if [ -f "$dst_memory_dir/$f" ]; then
+                    echo "Error: destination already has memory file '$f' — refusing to overwrite." >&2
+                    collision=true
+                fi
+            fi
+        done
+        if $collision; then
+            echo "" >&2
+            echo "Resolve manually before reassigning, or pick a different action for the conflicting files." >&2
+            exit 1
+        fi
+    fi
+
+    # === Print the action plan ===
+    if [ ${#memory_files[@]} -gt 0 ]; then
+        echo "Memory plan:"
+        local i
+        for i in "${!memory_files[@]}"; do
+            echo "  ${memory_actions[$i]}: ${memory_files[$i]}"
+        done
+        echo ""
+    fi
+
+    if [ "$dry_run" = "true" ]; then
+        echo "[DRY RUN] No changes made."
+        return
+    fi
+
+    # === Final confirm ===
+    read -p "Proceed? [y/N] " confirm
+    if [[ "$confirm" != [yY]* ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    # === Backup before any destructive op ===
+    if $DO_BACKUP; then
+        local backup_keys=("$found_in")
+        # Also include dest project key if it already exists (its MEMORY.md may be modified)
+        if [ -d "$target_project_dir" ]; then
+            backup_keys+=("$target_key")
+        fi
+        if ! backup_claude_state "reassign" "${backup_keys[@]}"; then
+            exit 1
+        fi
+    fi
+
+    # === Execute: memory ops first (so we know they succeed before touching session) ===
+    local n_moved=0 n_copied=0 n_kept=0 n_skipped=0
+
+    if [ ${#memory_files[@]} -gt 0 ]; then
+        # Only create dest memory dir if at least one file is being moved or copied
+        local need_dst_mem=false
+        local act
+        for act in "${memory_actions[@]}"; do
+            if [ "$act" = "move" ] || [ "$act" = "copy" ]; then
+                need_dst_mem=true
+                break
+            fi
+        done
+
+        if $need_dst_mem && [ ! -d "$dst_memory_dir" ]; then
+            mkdir -p "$dst_memory_dir"
+        fi
+
+        local i
+        for i in "${!memory_files[@]}"; do
+            local f="${memory_files[$i]}"
+            local act="${memory_actions[$i]}"
+            case "$act" in
+                move)
+                    if cp "$src_memory_dir/$f" "$dst_memory_dir/$f"; then
+                        rm -f "$src_memory_dir/$f"
+                        migrate_memory_index_line "$f" "$src_memory_dir/MEMORY.md" "$dst_memory_dir/MEMORY.md" move
+                        n_moved=$((n_moved + 1))
+                        echo "  moved: $f"
+                    else
+                        echo "  ERROR moving: $f (skipped)" >&2
+                    fi
+                    ;;
+                copy)
+                    if cp "$src_memory_dir/$f" "$dst_memory_dir/$f"; then
+                        migrate_memory_index_line "$f" "$src_memory_dir/MEMORY.md" "$dst_memory_dir/MEMORY.md" copy
+                        n_copied=$((n_copied + 1))
+                        echo "  copied: $f"
+                    else
+                        echo "  ERROR copying: $f (skipped)" >&2
+                    fi
+                    ;;
+                keep)
+                    n_kept=$((n_kept + 1))
+                    ;;
+                skip)
+                    n_skipped=$((n_skipped + 1))
+                    ;;
+            esac
+        done
+    fi
+
+    # === Then move the session itself ===
+    if [ ! -d "$target_project_dir" ]; then
+        echo "Creating project directory: $target_key"
+        mkdir -p "$target_project_dir"
+    fi
+
+    echo "Moving session JSONL..."
+    mv "$found_jsonl" "$target_project_dir/${session_id}.jsonl"
+
+    if [ -n "$found_session_dir" ] && [ -d "$found_session_dir" ]; then
+        echo "Moving session directory..."
+        mv "$found_session_dir" "$target_project_dir/${session_id}"
+    fi
+
+    echo ""
+    echo "Reassigned session $session_id."
+    if [ ${#memory_files[@]} -gt 0 ]; then
+        echo "Memory: moved $n_moved, copied $n_copied, kept $n_kept, skipped $n_skipped."
+    fi
+
+    # Copy a paste-ready two-line resume command (cd + claude --resume) to the
+    # clipboard. Trailing newline matters: it makes the terminal execute the
+    # second line on paste, so the user lands inside the resumed session
+    # without needing to hit Enter.
+    if $DO_CLIPBOARD; then
+        if printf 'cd "%s"\nclaude --resume %s\n' "$target_dir" "$session_id" | copy_to_clipboard; then
+            echo "📋 Resume command copied to clipboard — paste into any terminal"
+        fi
+    fi
+
+    echo ""
+    echo "Resume with:"
+    echo '  cd "'"$target_dir"'"'
+    echo "  claude --resume $session_id"
+}
+
+# Pre-parse global flags before subcommand dispatch
+filtered_args=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-backup)
+            DO_BACKUP=false
+            ;;
+        --no-clipboard)
+            DO_CLIPBOARD=false
+            ;;
+        *)
+            filtered_args+=("$arg")
+            ;;
+    esac
+done
+set -- "${filtered_args[@]}"
+
+# Parse arguments
+case "${1:-}" in
+    --list)
+        cmd_list
+        ;;
+    --reconcile)
+        cmd_reconcile "${2:-$HOME/Desktop}"
+        ;;
+    --dry-run)
+        if [ $# -lt 3 ]; then
+            echo "Usage: claude-mv --dry-run <source> <destination>" >&2
+            exit 1
+        fi
+        cmd_move true "$2" "$3"
+        ;;
+    --reassign|--reassign-dry-run)
+        subcmd="$1"
+        shift
+        mem_mode="prompt"
+        positional=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --memory-mode)
+                    mem_mode="${2:-}"
+                    shift 2
+                    ;;
+                --memory-mode=*)
+                    mem_mode="${1#--memory-mode=}"
+                    shift
+                    ;;
+                *)
+                    positional+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+
+        case "$mem_mode" in
+            prompt|move|copy|skip) ;;
+            *)
+                echo "Error: --memory-mode must be one of: prompt, move, copy, skip (got '$mem_mode')" >&2
+                exit 1
+                ;;
+        esac
+
+        if [ ${#positional[@]} -lt 2 ]; then
+            echo "Usage: claude-mv $subcmd [--memory-mode <prompt|move|copy|skip>] <session_uuid> <target_directory>" >&2
+            exit 1
+        fi
+
+        dry_run=false
+        [ "$subcmd" = "--reassign-dry-run" ] && dry_run=true
+        cmd_reassign "$mem_mode" "$dry_run" "${positional[0]}" "${positional[1]}"
+        ;;
+    --help|-h|"")
+        cat <<'HELP'
+claude-mv — Move directories without orphaning Claude Code sessions
+
+Usage:
+  claude-mv <source> <destination>                                Move + update sessions
+  claude-mv --dry-run <source> <dest>                             Preview move
+  claude-mv --reassign [--memory-mode <m>] <uuid> <target_dir>    Move a session to a different project
+  claude-mv --reassign-dry-run [--memory-mode <m>] <uuid> <dir>   Preview reassign
+  claude-mv --reconcile [search_root]                             Find orphaned sessions
+  claude-mv --list                                                List all sessions
+  claude-mv --help                                                Show this help
+
+Global flags (work with any command):
+  --no-backup      Skip the automatic backup before destructive ops (NOT recommended)
+  --no-clipboard   Don't copy follow-up commands to the system clipboard
+
+Clipboard auto-copy:
+  After a successful --reassign, the two-line resume command
+    cd "<target_dir>"
+    claude --resume <session_id>
+  is copied to your system clipboard so you can paste it into any terminal
+  to enter the moved thread without retyping. After a successful directory
+  move, the cd command for the new path is copied. Tries pbcopy (macOS),
+  xclip / xsel (Linux), clip.exe (WSL/Windows). Silently skips if no tool
+  is available. Use --no-clipboard to suppress.
+
+Backup safety net:
+  Before any destructive operation, claude-mv tarballs the affected
+  ~/.claude/projects/<key>/ directories to ~/.claude/claude-mv-backups/. The
+  backup path is printed with a one-line restore command. Backups are created
+  AFTER the user confirms but BEFORE any mv/cp/rm. Dry runs do NOT create
+  backups. If the backup itself fails, the operation is aborted.
+
+  To restore: tar -xzf <backup-file> -C /
+  To list backups: ls -lh ~/.claude/claude-mv-backups/
+
+Memory file handling for --reassign:
+  Memories are scoped per-project, not per-session. By default --reassign walks each
+  memory file interactively and asks how to handle it. Press Enter to accept the
+  default (move), since failing to migrate memories silently breaks session context.
+
+  --memory-mode prompt (default) — interactive per-file
+  --memory-mode move             — move all memories without asking
+  --memory-mode copy             — copy all to dest, leave source intact
+  --memory-mode skip             — leave all memories at source (the OLD broken behavior)
+
+Per-file actions in interactive mode:
+  [m] move with session  (default — Enter)
+  [k] keep at source
+  [c] copy to both
+  [s] skip and decide later
+HELP
+        ;;
+    *)
+        if [ $# -lt 2 ]; then
+            echo "Usage: claude-mv <source> <destination>" >&2
+            exit 1
+        fi
+        cmd_move false "$1" "$2"
+        ;;
+esac
