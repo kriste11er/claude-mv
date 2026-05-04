@@ -29,8 +29,17 @@
 
 set -euo pipefail
 
-CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
-CLAUDE_BACKUP_DIR="$HOME/.claude/claude-mv-backups"
+CLAUDE_DIR="$HOME/.claude"
+CLAUDE_PROJECTS_DIR="$CLAUDE_DIR/projects"
+CLAUDE_BACKUP_DIR="$CLAUDE_DIR/claude-mv-backups"
+CLAUDE_HISTORY_FILE="$CLAUDE_DIR/history.jsonl"
+
+# All per-project subdirectories under ~/.claude/ that get keyed by the encoded
+# directory path. When a directory moves, EACH of these needs to be renamed for
+# the project's full state to follow. We previously only handled `projects/`,
+# which silently lost file-history, todos, shell-snapshots, and debug state on
+# every move. Inspired by curiouslychase/dotfiles claude-mv (MIT).
+CLAUDE_STATE_SUBDIRS=("projects" "file-history" "todos" "shell-snapshots" "debug")
 
 # Global: whether to create a backup before destructive ops (set by --no-backup)
 DO_BACKUP=true
@@ -59,10 +68,11 @@ copy_to_clipboard() {
     return 0
 }
 
-# Tarball one or more ~/.claude/projects/<key>/ directories to a timestamped
-# backup file. Called after the user confirms a destructive operation but
-# BEFORE any actual mv/cp/rm. Returns 0 on success (or no-op if nothing to
-# back up), 1 on failure (caller should abort).
+# Tarball Claude state for one or more keys to a timestamped backup file.
+# Walks ALL per-project subdirs (projects, file-history, todos, shell-snapshots,
+# debug) plus history.jsonl, since any of those may be touched by an operation.
+# Called after the user confirms a destructive op but BEFORE any actual mv/cp/rm.
+# Returns 0 on success (or no-op if nothing to back up), 1 on failure.
 backup_claude_state() {
     local op_name="$1"
     shift
@@ -74,31 +84,123 @@ backup_claude_state() {
     ts=$(date +%Y-%m-%d-%H%M%S)
     local backup_file="$CLAUDE_BACKUP_DIR/${ts}-${op_name}.tar.gz"
 
-    # Collect existing project dirs as paths relative to root
+    # Collect existing state paths (relative to root) across all subdirs + history.jsonl
     local relpaths=()
-    local key
+    local key subdir
     for key in "${keys[@]}"; do
-        local abs="$CLAUDE_PROJECTS_DIR/$key"
-        if [ -e "$abs" ]; then
-            relpaths+=("${abs#/}")
-        fi
+        for subdir in "${CLAUDE_STATE_SUBDIRS[@]}"; do
+            local abs="$CLAUDE_DIR/$subdir/$key"
+            if [ -e "$abs" ]; then
+                relpaths+=("${abs#/}")
+            fi
+        done
     done
+    # Include history.jsonl since cmd_move rewrites it
+    if [ -f "$CLAUDE_HISTORY_FILE" ]; then
+        relpaths+=("${CLAUDE_HISTORY_FILE#/}")
+    fi
 
     if [ ${#relpaths[@]} -eq 0 ]; then
-        # Nothing to back up (no existing project state) — safe to proceed
-        echo "💾 Backup: nothing to back up (no existing project state)"
+        echo "💾 Backup: nothing to back up (no existing Claude state for these keys)"
         return 0
     fi
 
     if tar -C / -czf "$backup_file" "${relpaths[@]}" 2>/dev/null; then
         local size_kb
         size_kb=$(($(wc -c < "$backup_file") / 1024))
-        echo "💾 Backup: $backup_file (${size_kb}KB)"
+        echo "💾 Backup: $backup_file (${size_kb}KB, ${#relpaths[@]} paths)"
         echo "   Restore: tar -xzf '$backup_file' -C /"
         return 0
     else
         echo "ERROR: backup failed (tar exited non-zero) — aborting to avoid data loss" >&2
         return 1
+    fi
+}
+
+# Move Claude state for a (old_key → new_key) rename across all 5 subdirs.
+# Skips subdirs where old has no state. Refuses to overwrite if new already
+# exists in any subdir (caller should have collision-checked first).
+# Echoes one line per subdir actually moved.
+move_claude_state_for_key() {
+    local old_key="$1"
+    local new_key="$2"
+    local subdir
+    for subdir in "${CLAUDE_STATE_SUBDIRS[@]}"; do
+        local old_path="$CLAUDE_DIR/$subdir/$old_key"
+        local new_path="$CLAUDE_DIR/$subdir/$new_key"
+        if [ -e "$old_path" ]; then
+            mv "$old_path" "$new_path"
+            echo "  $subdir: $old_key → $new_key"
+        fi
+    done
+}
+
+# Check whether a destination key collides with any existing Claude state.
+# Returns 0 if all 5 subdirs are clear at $new_key, 1 if any collision exists
+# (and prints which subdirs collide to stderr).
+check_dest_state_collisions() {
+    local new_key="$1"
+    local collided=()
+    local subdir
+    for subdir in "${CLAUDE_STATE_SUBDIRS[@]}"; do
+        if [ -e "$CLAUDE_DIR/$subdir/$new_key" ]; then
+            collided+=("$subdir")
+        fi
+    done
+    if [ ${#collided[@]} -gt 0 ]; then
+        echo "Error: destination key '$new_key' already has Claude state in:" >&2
+        for s in "${collided[@]}"; do
+            echo "  - $s/" >&2
+        done
+        echo "" >&2
+        echo "Resolve manually before moving (delete or rename the existing dirs)." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Rewrite absolute path references inside a file (or all jsonl files in a dir).
+# Uses a sed delimiter unlikely to appear in absolute paths. Cross-platform sed
+# (BSD on macOS, GNU on Linux) handled via -i.tmp + rm trick.
+rewrite_paths_in_file() {
+    local file="$1"
+    local old_path="$2"
+    local new_path="$3"
+    # Use | as delimiter — paths essentially never contain |
+    sed -i.tmp "s|${old_path}|${new_path}|g" "$file"
+    rm -f "$file.tmp"
+}
+
+rewrite_paths_in_jsonls() {
+    local dir="$1"
+    local old_path="$2"
+    local new_path="$3"
+    [ -d "$dir" ] || return 0
+    local count=0
+    while IFS= read -r f; do
+        rewrite_paths_in_file "$f" "$old_path" "$new_path"
+        count=$((count + 1))
+    done < <(find "$dir" -name "*.jsonl" -type f 2>/dev/null)
+    if [ "$count" -gt 0 ]; then
+        echo "  jsonl path rewrite: $count file(s) in $(basename "$(dirname "$dir")")/$(basename "$dir")"
+    fi
+}
+
+# Extract the first cwd value from a session JSONL. Used by --reassign to learn
+# the original source path so we can rewrite it to the new target path.
+# Returns empty string if no cwd field is found (rare but possible for very
+# short or unusual sessions).
+extract_first_cwd() {
+    local jsonl="$1"
+    [ -f "$jsonl" ] || { echo ""; return; }
+    # Match the first "cwd":"..." occurrence and extract the value
+    local line
+    line=$(grep -m 1 -o '"cwd":"[^"]*"' "$jsonl" 2>/dev/null || true)
+    if [ -n "$line" ]; then
+        # Strip the "cwd":" prefix and trailing "
+        line="${line#\"cwd\":\"}"
+        line="${line%\"}"
+        echo "$line"
     fi
 }
 
@@ -265,6 +367,20 @@ cmd_move() {
     fi
     echo ""
 
+    # Pre-check: refuse if any of the 5 subdirs already has state at the new key
+    # (matches the conservative "refuse rather than prompt" posture).
+    local collision=false
+    for old_name in "${sessions_to_move[@]}"; do
+        local suffix="${old_name#$src_key}"
+        local new_name="${dst_key}${suffix}"
+        if ! check_dest_state_collisions "$new_name"; then
+            collision=true
+        fi
+    done
+    if $collision; then
+        exit 1
+    fi
+
     if [ "$dry_run" = "true" ]; then
         echo "[DRY RUN] No changes made."
         return
@@ -277,7 +393,7 @@ cmd_move() {
         exit 0
     fi
 
-    # Backup before any destructive op
+    # Backup before any destructive op (covers all 5 state subdirs + history.jsonl)
     if $DO_BACKUP; then
         local backup_keys=()
         for old_name in "${sessions_to_move[@]}"; do
@@ -290,20 +406,36 @@ cmd_move() {
         fi
     fi
 
-    # 1. Move the actual directory
+    # 1. Move the actual filesystem directory
     echo "Moving directory..."
     mv "$src" "$dst"
 
-    # 2. Rename all matching session directories
+    # 2. Rename Claude state for each affected key, across all 5 subdirs
+    echo "Updating Claude state subdirs..."
     for old_name in "${sessions_to_move[@]}"; do
         local suffix="${old_name#$src_key}"
         local new_name="${dst_key}${suffix}"
-        echo "Updating session: $old_name → $new_name"
-        mv "$CLAUDE_PROJECTS_DIR/$old_name" "$CLAUDE_PROJECTS_DIR/$new_name"
+        move_claude_state_for_key "$old_name" "$new_name"
     done
 
+    # 3. Rewrite embedded absolute paths inside session JSONLs so resumed
+    #    sessions display the new path (not the old one) in their history
+    echo "Rewriting embedded path references in session JSONLs..."
+    for old_name in "${sessions_to_move[@]}"; do
+        local suffix="${old_name#$src_key}"
+        local new_name="${dst_key}${suffix}"
+        rewrite_paths_in_jsonls "$CLAUDE_PROJECTS_DIR/$new_name" "$src" "$dst"
+    done
+
+    # 4. Rewrite history.jsonl (with backup) so the global history stays consistent
+    if [ -f "$CLAUDE_HISTORY_FILE" ]; then
+        cp "$CLAUDE_HISTORY_FILE" "$CLAUDE_HISTORY_FILE.backup"
+        rewrite_paths_in_file "$CLAUDE_HISTORY_FILE" "$src" "$dst"
+        echo "  history.jsonl rewritten (backup at history.jsonl.backup)"
+    fi
+
     echo ""
-    echo "Done. Directory moved and ${#sessions_to_move[@]} session(s) updated."
+    echo "Done. Directory moved and ${#sessions_to_move[@]} session key(s) updated across 5 state subdirs."
 
     # Copy a paste-ready cd command to the clipboard. Trailing newline makes
     # paste-and-execute work in the destination terminal.
@@ -647,12 +779,26 @@ cmd_reassign() {
         mkdir -p "$target_project_dir"
     fi
 
+    # Extract the source cwd from the JSONL before we move it, so we can
+    # rewrite that path to the new target_dir afterward
+    local source_cwd
+    source_cwd=$(extract_first_cwd "$found_jsonl")
+
     echo "Moving session JSONL..."
-    mv "$found_jsonl" "$target_project_dir/${session_id}.jsonl"
+    local new_jsonl="$target_project_dir/${session_id}.jsonl"
+    mv "$found_jsonl" "$new_jsonl"
 
     if [ -n "$found_session_dir" ] && [ -d "$found_session_dir" ]; then
         echo "Moving session directory..."
         mv "$found_session_dir" "$target_project_dir/${session_id}"
+    fi
+
+    # Rewrite embedded path references so the resumed session shows the new
+    # project path in its history (consistent with cmd_move behavior)
+    if [ -n "$source_cwd" ] && [ "$source_cwd" != "$target_dir" ]; then
+        echo "Rewriting embedded path references..."
+        rewrite_paths_in_file "$new_jsonl" "$source_cwd" "$target_dir"
+        echo "  jsonl path rewrite: $(basename "$new_jsonl") (\"$source_cwd\" → \"$target_dir\")"
     fi
 
     echo ""
@@ -775,15 +921,42 @@ Clipboard auto-copy:
   xclip / xsel (Linux), clip.exe (WSL/Windows). Silently skips if no tool
   is available. Use --no-clipboard to suppress.
 
+Claude state subdirs handled by a directory move:
+  When you move a directory, claude-mv updates ALL of these per-project
+  subdirectories under ~/.claude/, not just projects/:
+    projects/<key>/         conversation history (sessions, memory)
+    file-history/<key>/     Claude Code's file-edit history
+    todos/<key>/            TaskCreate/TaskUpdate task lists
+    shell-snapshots/<key>/  shell session snapshots
+    debug/<key>/            debug logs
+  It also rewrites embedded absolute paths inside session JSONLs and inside
+  ~/.claude/history.jsonl (with a .backup file) so resumed sessions show
+  the new path consistently.
+
 Backup safety net:
-  Before any destructive operation, claude-mv tarballs the affected
-  ~/.claude/projects/<key>/ directories to ~/.claude/claude-mv-backups/. The
-  backup path is printed with a one-line restore command. Backups are created
-  AFTER the user confirms but BEFORE any mv/cp/rm. Dry runs do NOT create
-  backups. If the backup itself fails, the operation is aborted.
+  Before any destructive operation, claude-mv tarballs the affected state
+  across all 5 subdirs PLUS history.jsonl to ~/.claude/claude-mv-backups/.
+  The backup path is printed with a one-line restore command. Created AFTER
+  the user confirms but BEFORE any mv/cp/rm. Dry runs do NOT create backups.
+  If the backup itself fails, the operation is aborted.
 
   To restore: tar -xzf <backup-file> -C /
   To list backups: ls -lh ~/.claude/claude-mv-backups/
+
+  NOTE: claude-mv backups are TRANSACTIONAL — one tarball per operation,
+  meant for "undo my last move." For ongoing periodic backup of your full
+  ~/.claude/ state (memory files, all sessions, etc.), use a separate tool
+  like rsync to a Dropbox folder, restic, borg, or Time Machine. See README
+  section "Backing up your Claude state" for recommendations.
+
+Caveats:
+  * Don't run claude-mv from a Claude session whose own directory is being
+    moved. Run it from a terminal or from a different Claude thread. Moving
+    the cwd out from under a running session breaks that session.
+  * Restart any actively-running Claude session in the moved directory after
+    the move. The on-disk state moves correctly, but a live process holds
+    the old encoded path in memory until you exit and re-enter at the new
+    path. The auto-copied resume / cd command makes this easy.
 
 Memory file handling for --reassign:
   Memories are scoped per-project, not per-session. By default --reassign walks each

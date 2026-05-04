@@ -6,17 +6,17 @@
 # makes it executable, and reports whether ~/.local/bin is in your PATH.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<user>/claude-mv/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kriste11er/claude-mv/main/install.sh | bash
 #
 # Or, to inspect first (recommended):
-#   curl -fsSL -o install.sh https://raw.githubusercontent.com/<user>/claude-mv/main/install.sh
+#   curl -fsSL -o install.sh https://raw.githubusercontent.com/kriste11er/claude-mv/main/install.sh
 #   less install.sh
 #   bash install.sh
 
 set -euo pipefail
 
 # Configuration — update REPO when you publish
-REPO="${CLAUDE_MV_REPO:-<user>/claude-mv}"
+REPO="${CLAUDE_MV_REPO:-kriste11er/claude-mv}"
 BRANCH="${CLAUDE_MV_BRANCH:-main}"
 INSTALL_DIR="${CLAUDE_MV_INSTALL_DIR:-$HOME/.local/bin}"
 SCRIPT_NAME="claude-mv"

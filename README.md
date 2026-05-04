@@ -55,7 +55,7 @@ Clone or download this repo, copy `claude-mv` to a directory in your `PATH`,
 and make it executable:
 
 ```bash
-git clone https://github.com/<user>/claude-mv.git
+git clone https://github.com/kriste11er/claude-mv.git
 cp claude-mv/claude-mv ~/.local/bin/   # or wherever you keep user scripts
 chmod +x ~/.local/bin/claude-mv
 ```
@@ -76,7 +76,7 @@ claude-mv --help
 ### One-line install (curl)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<user>/claude-mv/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kriste11er/claude-mv/main/install.sh | bash
 ```
 
 This downloads the latest `claude-mv`, places it at `~/.local/bin/claude-mv`,
@@ -86,7 +86,7 @@ If you want to inspect the install script first (recommended), download it
 explicitly:
 
 ```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/<user>/claude-mv/main/install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/kriste11er/claude-mv/main/install.sh
 less install.sh   # read it
 bash install.sh
 ```
@@ -177,10 +177,52 @@ claude-mv --help
 
 Full reference for all flags and behavior.
 
+## Caveats
+
+Two things to know before you run a move:
+
+### Don't run `claude-mv` from a Claude session whose own directory is being moved
+
+Run it from a regular terminal, or from a different Claude thread. Moving
+the cwd out from under a running session breaks that session — the shell
+the running Claude started in will end up pointing at a directory that no
+longer exists at the old path.
+
+### Restart any actively-running Claude session in the moved directory
+
+Even if you ran `claude-mv` from a different terminal, any **live** Claude
+process inside the moved directory is still pointing at the old encoded
+path in memory. The on-disk state moves correctly, but the running process
+won't see appended messages there until you exit and re-enter. The
+auto-copied resume / cd command (already in your clipboard after a
+successful operation) makes the re-entry one paste away.
+
+## What `claude-mv` updates when you move a directory
+
+When you move a directory, `claude-mv` walks **all** of these per-project
+state subdirectories under `~/.claude/`, not just `projects/`:
+
+| Subdir | What it stores |
+|--------|----------------|
+| `projects/<key>/` | conversation history (sessions, memory) |
+| `file-history/<key>/` | Claude Code's file-edit history |
+| `todos/<key>/` | TaskCreate/TaskUpdate task lists |
+| `shell-snapshots/<key>/` | shell session snapshots |
+| `debug/<key>/` | debug logs |
+
+Plus it rewrites embedded absolute paths inside session JSONLs and inside
+`~/.claude/history.jsonl` (with a `.backup` file as a safety net) so
+resumed sessions display the new path consistently in their history.
+
+If only `projects/` got renamed and the others didn't follow (this was a
+common bug in earlier directory-move scripts), Claude Code would silently
+lose your file-edit history, task lists, and shell snapshots for the moved
+project. `claude-mv` keeps all of it together.
+
 ## Safety: backups before any destructive operation
 
 Every move, reassign, and rename automatically creates a tarball backup of
-the affected `~/.claude/projects/<key>/` directories at:
+the affected state across all 5 subdirs (and `history.jsonl`) at:
 
 ```
 ~/.claude/claude-mv-backups/YYYY-MM-DD-HHMMSS-<op>.tar.gz
@@ -202,6 +244,63 @@ To list backups: `ls -lh ~/.claude/claude-mv-backups/`
 To opt out (not recommended): pass `--no-backup` as a global flag.
 
 Dry runs (`--dry-run`, `--reassign-dry-run`) never create backups.
+
+## Backing up your Claude state
+
+`claude-mv`'s built-in backup is **transactional** — one tarball per
+operation, designed for "undo my last move." That's the right scope for
+this tool.
+
+But your `~/.claude/` directory contains a lot of valuable state beyond what
+`claude-mv` touches: every session in every project you've ever opened with
+Claude Code, every memory file, every CLAUDE.md you've configured, settings,
+hooks, statusline scripts, and so on. **None of that is backed up by
+`claude-mv` automatically.**
+
+If you'd be sad to lose it, set up a separate periodic backup. Options
+ranked by setup effort:
+
+### Easy: rsync to Dropbox / iCloud / OneDrive (cloud sync)
+
+Add a periodic rsync to a synced folder. Cron entry on macOS or Linux:
+
+```bash
+# Hourly snapshot to a Dropbox folder
+0 * * * * rsync -a --delete ~/.claude/ ~/Dropbox/backups/claude-state/
+```
+
+Or use `launchd` on macOS (more reliable than cron). The synced folder
+takes care of off-machine backup.
+
+### More polished: restic or borg
+
+Both are content-addressed dedup backup tools. Set them up to back
+`~/.claude/` to a local external drive, NAS, or cloud target (S3,
+Backblaze B2, etc.). They handle versioning, deduplication, and
+encryption.
+
+```bash
+# restic example, daily snapshot
+0 2 * * * restic -r /path/to/backup/repo backup ~/.claude
+```
+
+### Built-in: macOS Time Machine
+
+If you're on macOS and Time Machine is enabled, `~/.claude/` is already
+being backed up hourly to whatever drive you've designated. Verify:
+
+```bash
+tmutil isexcluded ~/.claude    # should print "Not excluded"
+```
+
+### What NOT to do
+
+- **Don't** put `~/.claude/` under git. The session JSONLs are large,
+  growing, frequently rewritten, and contain conversation content that
+  may be sensitive. Wrong tool for this data.
+- **Don't** rely solely on `claude-mv` backups for disaster recovery.
+  Those tarballs only cover what was about to be moved, not your full
+  state.
 
 ## Requirements
 
@@ -248,6 +347,16 @@ silently lost its loaded memories — which is what motivated the
 `--reassign --memory-mode` interactive flow). Claude generated most of the
 code under that direction, including the helper functions, error handling,
 and cross-platform clipboard support.
+
+**Inspiration & prior art:** The five-subdirectory handling
+(`projects`, `file-history`, `todos`, `shell-snapshots`, `debug`) and the
+embedded-path-rewrite-in-JSONLs technique were inspired by
+[curiouslychase/dotfiles](https://github.com/curiouslychase/dotfiles)'s
+`scripts/claude-mv` — a smaller solo-developer script that solves a related
+problem. Their tool focuses on directory moves; ours adds session reassign,
+memory file migration, automatic backups, clipboard auto-copy, dry-runs,
+reconcile, and a few other features. Worth a look if you want a smaller
+single-file tool with just the move-rename functionality.
 
 If you're curious about the development process, the entire conversation
 history that produced this tool is preserved in Jaguar's private workspace,
