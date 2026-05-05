@@ -123,7 +123,24 @@ Use this when you want to move a specific thread to a different project home
 — for example, you started a thread in your top-level workspace folder but
 realize it actually belongs in a sub-project.
 
-What happens:
+#### Quick primer: what are "memory files"?
+
+Claude Code stores per-project memory at
+`~/.claude/projects/<encoded-path>/memory/*.md`. Each file has YAML
+frontmatter (`name`, `description`, `type`) and a body. They're loaded
+into every Claude session that runs inside that project directory.
+Common types:
+- `feedback` — user preferences ("don't use em-dashes", "default to terse")
+- `project` — facts about the codebase, architecture, ongoing work
+- `reference` — pointers to external systems (Linear, dashboards, sheets)
+- `user` — info about the user themselves
+
+If you've never used Claude Code's memory feature, you may have no memory
+files. The `--reassign` flow is a no-op in that case (just moves the
+session, no prompts).
+
+#### What happens
+
 1. Tool finds the session JSONL in `~/.claude/projects/<key>/`
 2. Discovers all memory files (`*.md`) in the source project's `memory/`
    directory (excluding the `MEMORY.md` index)
@@ -145,6 +162,28 @@ For non-interactive use:
 - `--memory-mode skip` — leave all at source
 
 Preview: `claude-mv --reassign-dry-run [--memory-mode mode] <uuid> <dir>`
+
+#### Tip: search for relevance before deciding move/copy/keep
+
+The default action is "move," which is the right call when the source
+project's memories were specifically built up around the session you're
+moving. **It's the wrong call when memories are shared across many
+sessions** — moving them strips context from the others.
+
+A useful pattern: before running `--reassign`, grep the source memory
+dir for keywords related to the session you're moving:
+
+```bash
+SRC_KEY="-Users-you-Desktop-old-project"   # encoded source path
+grep -rli 'company-name\|key-person' ~/.claude/projects/$SRC_KEY/memory/
+```
+
+If only a small subset matches, those are the candidates to **move** or
+**copy** with the session — and the rest you can confidently **keep** at
+the source. If everything is general-purpose project context, the right
+answer is often `--memory-mode skip` (leave it all alone) and rely on
+`CLAUDE.md` inheritance + the session's own context to keep the moved
+thread oriented.
 
 ### Find orphaned sessions
 
@@ -197,6 +236,61 @@ won't see appended messages there until you exit and re-enter. The
 auto-copied resume / cd command (already in your clipboard after a
 successful operation) makes the re-entry one paste away.
 
+### Use `claude --resume <uuid>` after a move, not plain `claude`
+
+After moving a directory, if you `cd` into the new location and run plain
+`claude`, you get a **new** session. The old session's history is there
+on disk (we moved it), but Claude doesn't auto-pick-up old sessions when
+you start fresh. To re-enter the old conversation, use
+`claude --resume <session-uuid>`. The clipboard auto-copy gives you the
+exact command after every successful move/reassign.
+
+You can also list available sessions in the new location with
+`claude --list` if you need to find a UUID by hand.
+
+### External references aren't auto-updated
+
+`claude-mv` updates everything inside `~/.claude/`, but anything **outside**
+that directory which hardcodes the old path is on you to fix. After a
+significant move, grep for the old path in the usual suspects:
+
+```bash
+grep -rn 'old/path/' ~/.bashrc ~/.zshrc ~/.bash_profile ~/.config 2>/dev/null
+```
+
+Common offenders:
+- shell aliases and functions in `~/.bashrc` / `~/.zshrc`
+- `cron` and `launchd` job paths
+- IDE / editor config (VSCode workspace files, JetBrains projects)
+- Scripts in your dotfiles that hardcode project paths
+- Symlinks pointing into the moved tree (re-create them, or use `find -L`)
+
+### No `--undo` command (yet)
+
+To reverse a move, just run `claude-mv` in the opposite direction:
+
+```bash
+claude-mv new_path old_path
+```
+
+If you want to roll back fully (including the JSONL path-rewrite),
+extract the auto-created backup tarball:
+
+```bash
+tar -xzf ~/.claude/claude-mv-backups/YYYY-MM-DD-HHMMSS-<op>.tar.gz -C /
+```
+
+…and then `mv new_path old_path` to restore the filesystem side. The
+backup is the more accurate undo (it restores embedded paths inside
+JSONLs to their pre-rewrite state).
+
+### Don't run two `claude-mv` operations in parallel
+
+The tool isn't built to be safe under concurrent invocation. Two moves
+running at once could leave the Claude state directories in a half-renamed
+state, with neither completing cleanly. Wait for one to finish before
+starting another.
+
 ## What `claude-mv` updates when you move a directory
 
 When you move a directory, `claude-mv` walks **all** of these per-project
@@ -244,6 +338,25 @@ To list backups: `ls -lh ~/.claude/claude-mv-backups/`
 To opt out (not recommended): pass `--no-backup` as a global flag.
 
 Dry runs (`--dry-run`, `--reassign-dry-run`) never create backups.
+
+### Pruning old backups
+
+`claude-mv` never auto-deletes backups. The directory grows unboundedly
+with each operation. After heavy use, you may want to prune.
+
+Manual one-shot:
+
+```bash
+# Delete claude-mv backups older than 30 days
+find ~/.claude/claude-mv-backups -name "*.tar.gz" -mtime +30 -delete
+
+# Or keep only the 20 most recent
+ls -t ~/.claude/claude-mv-backups/*.tar.gz | tail -n +21 | xargs rm -f
+```
+
+Set it on a schedule with cron / launchd if you want this to run
+automatically. There's deliberately no built-in pruning — the tool
+shouldn't delete backups you might still want.
 
 ## Backing up your Claude state
 
